@@ -132,7 +132,12 @@ def create_app(config: dict | None = None) -> Flask:
 
         try:
             rows = parse_csv(upload.read(), version["definition"])
-            count = db.import_records(version_id, rows, version["definition"])
+            count = db.import_records(
+                version_id,
+                rows,
+                version["definition"],
+                version["definition_raw"],
+            )
         except (CsvError, db.DataError) as exc:
             message = exc.message if isinstance(exc, CsvError) else str(exc)
             errors = exc.errors if isinstance(exc, CsvError) else []

@@ -15,11 +15,22 @@ items that are hidden in a completion never influence display decisions.
 The engine evaluates every completion in parallel using Python integers as
 bit masks: with at most 12 items there are at most 4096 completions, i.e. a
 4096-bit mask.  This keeps per-record judgment cheap enough for 50,000 rows.
+
+Preparing a version builds the display mask of every item once, using all
+items as free variables.  A record is then judged with plain bit operations:
+intersect the masks of its known answers to obtain the consistent completions,
+then compare each item's display mask against that set.  No condition group is
+walked per record.  Prepared plans are cached by the exact serialised rule set
+with a bounded LRU, so imports and single-record corrections in the same
+version share one plan and versions with different rules never share one.
 """
 
 from __future__ import annotations
 
-from .version_def import loads
+import threading
+from collections import OrderedDict
+
+from .version_def import dumps, loads
 
 ANSWER_YES = "是"
 ANSWER_NO = "否"
@@ -32,14 +43,22 @@ CATEGORY_LABELS = {
     "pending": "待核",
 }
 
-_MASK_CACHE: dict[int, tuple[int, list[int]]] = {}
+_MASK_CACHE: "OrderedDict[int, tuple[int, list[int]]]" = OrderedDict()
+_MASK_CACHE_LIMIT = 16
+_MASK_CACHE_LOCK = threading.Lock()
+
+PLAN_CACHE_LIMIT = 16
+_PLAN_CACHE: "OrderedDict[str, PreparedRules]" = OrderedDict()
+_PLAN_CACHE_LOCK = threading.Lock()
 
 
 def _masks(variable_count: int) -> tuple[int, list[int]]:
     """Return (all_ones, true_masks) for ``variable_count`` free variables."""
-    cached = _MASK_CACHE.get(variable_count)
-    if cached is not None:
-        return cached
+    with _MASK_CACHE_LOCK:
+        cached = _MASK_CACHE.get(variable_count)
+        if cached is not None:
+            _MASK_CACHE.move_to_end(variable_count)
+            return cached
 
     total = 1 << variable_count
     all_ones = (1 << total) - 1
@@ -55,59 +74,122 @@ def _masks(variable_count: int) -> tuple[int, list[int]]:
         true_masks.append(mask)
 
     result = (all_ones, true_masks)
-    _MASK_CACHE[variable_count] = result
+    with _MASK_CACHE_LOCK:
+        _MASK_CACHE[variable_count] = result
+        _MASK_CACHE.move_to_end(variable_count)
+        while len(_MASK_CACHE) > _MASK_CACHE_LIMIT:
+            _MASK_CACHE.popitem(last=False)
     return result
+
+
+class PreparedRules:
+    """Display masks for one exact rule set, reusable across every record.
+
+    ``shown_masks[i]`` has one bit per completion of all items (是=1, 否=0).
+    Judging a record only intersects those masks with the completions that
+    agree with its known answers; no condition group is walked again.
+    """
+
+    __slots__ = (
+        "item_count",
+        "all_ones",
+        "yes_masks",
+        "no_masks",
+        "shown_masks",
+    )
+
+    def __init__(self, items: list[dict]):
+        item_count = len(items)
+        all_ones, yes_masks = _masks(item_count)
+        shown_masks: list[int] = [0] * item_count
+
+        for index, item in enumerate(items):
+            if item["unconditional"]:
+                shown_masks[index] = all_ones
+                continue
+
+            shown_mask = 0
+            for group in item["groups"]:
+                group_mask = all_ones
+                for reference, required in group:
+                    reference_mask = shown_masks[reference]
+                    if reference_mask == 0:
+                        group_mask = 0
+                        break
+                    value_mask = (
+                        yes_masks[reference]
+                        if required == ANSWER_YES
+                        else ~yes_masks[reference]
+                    )
+                    group_mask &= reference_mask & value_mask
+                    if group_mask == 0:
+                        break
+                shown_mask |= group_mask
+
+            shown_masks[index] = shown_mask & all_ones
+
+        self.item_count = item_count
+        self.all_ones = all_ones
+        self.yes_masks = yes_masks
+        self.no_masks = [mask ^ all_ones for mask in yes_masks]
+        self.shown_masks = shown_masks
+
+    def judge(self, answers: dict[int, str]) -> list[str]:
+        """Classify each item under every completion consistent with answers."""
+        consistent = self.all_ones
+        yes_masks = self.yes_masks
+        no_masks = self.no_masks
+        for index, value in answers.items():
+            if not 0 <= index < self.item_count:
+                continue
+            consistent &= (
+                yes_masks[index] if value == ANSWER_YES else no_masks[index]
+            )
+
+        categories: list[str] = []
+        for index, shown in enumerate(self.shown_masks):
+            visible = shown & consistent
+            if visible == 0:
+                categories.append("exempt")
+            elif visible == consistent:
+                categories.append("answered" if index in answers else "missing")
+            else:
+                categories.append("pending")
+        return categories
+
+
+def prepare(definition: dict, key: str | None = None) -> PreparedRules:
+    """Build or reuse the prepared rules for exactly this definition.
+
+    ``key`` may be the definition text exactly as stored in the database, so
+    loading the same version avoids re-serialising its rules.  Otherwise the
+    key is the serialised rule set.  Either way, versions whose rules differ
+    can never share a plan, and at most ``PLAN_CACHE_LIMIT`` plans are kept.
+    """
+    cache_key = dumps(definition) if key is None else key
+    with _PLAN_CACHE_LOCK:
+        cached = _PLAN_CACHE.get(cache_key)
+        if cached is not None:
+            _PLAN_CACHE.move_to_end(cache_key)
+            return cached
+
+    prepared = PreparedRules(definition["items"])
+
+    with _PLAN_CACHE_LOCK:
+        existing = _PLAN_CACHE.get(cache_key)
+        if existing is not None:
+            _PLAN_CACHE.move_to_end(cache_key)
+            return existing
+        _PLAN_CACHE[cache_key] = prepared
+        _PLAN_CACHE.move_to_end(cache_key)
+        while len(_PLAN_CACHE) > PLAN_CACHE_LIMIT:
+            _PLAN_CACHE.popitem(last=False)
+    return prepared
 
 
 def judge(definition: dict, answers: dict[int, str]) -> list[str]:
     """Classify each item; ``answers`` maps item index to 是/否."""
-    items = definition["items"]
-    item_count = len(items)
-    blank = [index for index in range(item_count) if index not in answers]
-    all_ones, true_masks = _masks(len(blank))
-    variable_of = {item_index: position for position, item_index in enumerate(blank)}
-
-    displayed: list[int] = [0] * item_count
-
-    for index, item in enumerate(items):
-        if item["unconditional"]:
-            displayed[index] = all_ones
-            continue
-
-        shown_mask = 0
-        for group in item["groups"]:
-            group_mask = all_ones
-            for reference, required in group:
-                reference_mask = displayed[reference]
-                if reference_mask == 0:
-                    group_mask = 0
-                    break
-
-                if reference in answers:
-                    value_mask = (
-                        all_ones if answers[reference] == required else 0
-                    )
-                else:
-                    yes_mask = true_masks[variable_of[reference]]
-                    value_mask = yes_mask if required == ANSWER_YES else ~yes_mask
-
-                group_mask &= reference_mask & value_mask
-                if group_mask == 0:
-                    break
-            shown_mask |= group_mask
-
-        displayed[index] = shown_mask & all_ones
-
-    categories: list[str] = []
-    for index in range(item_count):
-        mask = displayed[index]
-        if mask == 0:
-            categories.append("exempt")
-        elif mask == all_ones:
-            categories.append("answered" if index in answers else "missing")
-        else:
-            categories.append("pending")
-    return categories
+    return prepare(definition).judge(answers)
 
 
 def display_under_answers(definition: dict, answers: dict[int, str]) -> list[bool]:
@@ -145,7 +227,10 @@ def count_categories(category_lists: list[list[str]]) -> dict[int, dict[str, int
 __all__ = [
     "CATEGORIES",
     "CATEGORY_LABELS",
+    "PLAN_CACHE_LIMIT",
+    "PreparedRules",
     "judge",
+    "prepare",
     "display_under_answers",
     "count_categories",
     "loads",

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from flask import current_app, g
 
-from .judge import CATEGORIES, judge
+from .judge import CATEGORIES, prepare
 from .version_def import loads
 
 SCHEMA = """
@@ -180,6 +180,7 @@ def get_version(version_id: int) -> dict | None:
         "name": row["name"],
         "source": row["source"],
         "definition": loads(row["definition"]),
+        "definition_raw": row["definition"],
         "created_at": row["created_at"],
         "record_count": record_count,
     }
@@ -215,7 +216,10 @@ def _serialise_categories(categories: list[str]) -> str:
 
 
 def import_records(
-    version_id: int, rows: list[tuple[str, list[str]]], definition: dict
+    version_id: int,
+    rows: list[tuple[str, list[str]]],
+    definition: dict,
+    definition_raw: str | None = None,
 ) -> int:
     """Import validated rows atomically; returns number of records."""
     items = definition["items"]
@@ -223,6 +227,7 @@ def import_records(
     counts = [{category: 0 for category in CATEGORIES} for _ in items]
     prepared: list[tuple] = []
     stamp = utcnow()
+    rules = prepare(definition, definition_raw)
 
     for record_no, answers in rows:
         answer_map = {
@@ -230,7 +235,7 @@ def import_records(
             for index, value in enumerate(answers)
             if value in ("是", "否")
         }
-        categories = judge(definition, answer_map)
+        categories = rules.judge(answer_map)
         for index, category in enumerate(categories):
             counts[index][category] += 1
         prepared.append(
@@ -316,7 +321,8 @@ def correct_answer(
         ).fetchone()
         if version_row is None:
             raise DataError("表版不存在。")
-        definition = loads(version_row["definition"])
+        definition_raw = version_row["definition"]
+        definition = loads(definition_raw)
 
         row = connection.execute(
             "SELECT answers, categories FROM records"
@@ -342,7 +348,7 @@ def correct_answer(
             for index, answer in enumerate(answers)
             if answer in ("是", "否")
         }
-        new_categories = judge(definition, answer_map)
+        new_categories = prepare(definition, definition_raw).judge(answer_map)
 
         connection.execute(
             "UPDATE records SET answers = ?, categories = ?, updated_at = ?"

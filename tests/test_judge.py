@@ -90,3 +90,19 @@ def test_multiple_blank_parents_combinatorial():
     # 甲 blank, 乙 | 1=是 => 乙 pending; 丙 | 1=是 & 2=是
     d = definition("甲\n乙 | 1=是\n丙 | 1=是 & 2=是")
     assert judge(d, answers("", "", "")) == ["missing", "pending", "pending"]
+
+
+def test_clearing_answer_reconsiders_both_supplements():
+    # 甲=是, 乙=否, 丙 residual 是.  Clear 乙: 乙 stays shown (甲=是) so it is
+    # missing, and 丙 shows only when the supplement makes 乙=是 -> pending.
+    d = definition("甲\n乙 | 1=是\n丙 | 2=是")
+    assert judge(d, answers("是", "", "是")) == ["answered", "missing", "pending"]
+
+
+def test_clearing_parent_ignores_residual_hidden_child_answers():
+    # 甲=是, 乙=是, 丙=是.  Clear 甲: under supplement 甲=否, 乙 is hidden;
+    # its residual 是 must not make 丙 appear.
+    d = definition("甲\n乙 | 1=是\n丙 | 2=是")
+    assert judge(d, answers("", "是", "是")) == ["missing", "pending", "pending"]
+    # With 甲 answered 否, the residual answers stay hidden entirely.
+    assert judge(d, answers("否", "是", "是")) == ["answered", "exempt", "exempt"]

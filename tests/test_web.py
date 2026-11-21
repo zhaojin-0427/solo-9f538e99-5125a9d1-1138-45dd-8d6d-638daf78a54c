@@ -1,4 +1,5 @@
 import io
+import random
 
 import pytest
 
@@ -214,6 +215,116 @@ def test_failed_correction_leaves_everything_unchanged(client, monkeypatch):
     assert after_counts == before_counts
 
 
+def test_import_prepares_rules_once_and_correction_reuses_them(client, monkeypatch):
+    from app import judge as judge_module
+
+    version_id = make_version(client)
+    calls = {"count": 0}
+    real_prepared_rules = judge_module.PreparedRules
+
+    class CountingRules(real_prepared_rules):
+        def __init__(self, items):
+            calls["count"] += 1
+            super().__init__(items)
+
+    monkeypatch.setattr(judge_module, "PreparedRules", CountingRules)
+
+    upload(
+        client,
+        version_id,
+        csv_bytes(
+            [
+                ("R1", "是", "是", "是", "是"),
+                ("R2", "", "", "", ""),
+                ("R3", "否", "是", "是", "是"),
+            ]
+        ),
+    )
+    # One preparation served all three records.
+    assert calls["count"] == 1
+
+    client.post(
+        f"/versions/{version_id}/records/R2/correct",
+        data={"item_index": "0", "value": "是"},
+        follow_redirects=True,
+    )
+    # The correction reused the same prepared plan; no rebuild happened.
+    assert calls["count"] == 1
+    with client.application.app_context():
+        assert db.get_record(version_id, "R2")["categories"] == [
+            "answered",
+            "missing",
+            "pending",
+            "missing",
+        ]
+
+
+def test_clearing_answer_reconsiders_both_supplements_and_ignores_hidden(
+    client,
+):
+    definition = """\
+甲
+乙 | 1=是
+丙 | 2=是
+"""
+    version_id = make_version(client, name="清空测试", definition=definition)
+    header = "记录号,甲,乙,丙\n"
+    # Child and grandchild both answered while shown.
+    data = (header + "R1,是,是,是\n").encode("utf-8")
+    assert upload(client, version_id, data).status_code == 302
+
+    response = client.post(
+        f"/versions/{version_id}/records/R1/correct",
+        data={"item_index": "0", "value": ""},
+        follow_redirects=True,
+    )
+    page = response.get_data(as_text=True)
+    assert "更正已保存" in page
+
+    with client.application.app_context():
+        record = db.get_record(version_id, "R1")
+        counts = db.get_counts(version_id, 3)
+    # 甲 blank -> 乙 pending; 丙 depends on whether 乙 is shown and says 是.
+    assert record["answers"] == ["", "是", "是"]
+    assert record["categories"] == ["missing", "pending", "pending"]
+    assert counts[0] == {"answered": 0, "missing": 1, "exempt": 0, "pending": 0}
+    assert counts[1] == {"answered": 0, "missing": 0, "exempt": 0, "pending": 1}
+    assert counts[2] == {"answered": 0, "missing": 0, "exempt": 0, "pending": 1}
+
+    # Clearing 乙 (already pending): 丙's residual 是 must not keep it answered.
+    client.post(
+        f"/versions/{version_id}/records/R1/correct",
+        data={"item_index": "1", "value": ""},
+        follow_redirects=True,
+    )
+    with client.application.app_context():
+        record = db.get_record(version_id, "R1")
+        counts = db.get_counts(version_id, 3)
+    assert record["categories"] == ["missing", "pending", "pending"]
+    assert counts[1] == {"answered": 0, "missing": 0, "exempt": 0, "pending": 1}
+    assert counts[2] == {"answered": 0, "missing": 0, "exempt": 0, "pending": 1}
+
+
+def test_versions_with_different_rules_do_not_share_prepared_rules(client):
+    yes_version = make_version(
+        client, name="规则是", definition="甲\n乙 | 1=是\n"
+    )
+    no_version = make_version(
+        client, name="规则否", definition="甲\n乙 | 1=否\n"
+    )
+    for version_id in (yes_version, no_version):
+        header = "记录号,甲,乙\n"
+        assert upload(
+            client, version_id, (header + "R1,是,\n").encode("utf-8")
+        ).status_code == 302
+
+    with client.application.app_context():
+        yes_record = db.get_record(yes_version, "R1")
+        no_record = db.get_record(no_version, "R1")
+    assert yes_record["categories"] == ["answered", "missing"]
+    assert no_record["categories"] == ["answered", "exempt"]
+
+
 def test_failed_correction_survives_restart(tmp_path):
     database = str(tmp_path / "restart.db")
 
@@ -288,6 +399,74 @@ def test_over_limit_rejected(client):
     response = upload(client, version_id, csv_bytes(rows))
     assert response.status_code == 400
     assert "最多导入 50000" in response.get_data(as_text=True).replace(",", "")
+
+
+def test_fifty_thousand_varied_records_match_judge(client, monkeypatch):
+    """A large batch with varied answers and multi-group conditions.
+
+    Every stored judgment must equal the engine's own result, the whole import
+    must build the prepared rules once, and counts must aggregate correctly.
+    """
+    from app import judge as judge_module
+
+    definition = """\
+甲
+乙
+丙 | 1=是
+丁 | 1=是 & 2=是
+戊 | 1=否 ; 2=否
+己 | 3=是 ; 4=是 & 5=否
+"""
+    names = ["甲", "乙", "丙", "丁", "戊", "己"]
+    version_id = make_version(client, name="大批次", definition=definition)
+    rng = random.Random(20261121)
+
+    builds = {"count": 0}
+    real_prepared_rules = judge_module.PreparedRules
+
+    class CountingRules(real_prepared_rules):
+        def __init__(self, items):
+            builds["count"] += 1
+            super().__init__(items)
+
+    monkeypatch.setattr(judge_module, "PreparedRules", CountingRules)
+
+    rows = []
+    expected = {}
+    for number in range(50_000):
+        values = []
+        for _ in names:
+            roll = rng.random()
+            values.append("是" if roll < 0.4 else "否" if roll < 0.7 else "")
+        record_no = f"R{number}"
+        rows.append((record_no, values))
+        expected[record_no] = values
+
+    header = "记录号," + ",".join(names) + "\n"
+    body = "".join(f"{no},{a},{b},{c},{d},{e},{f}\n" for no, (a, b, c, d, e, f) in rows)
+    response = upload(client, version_id, (header + body).encode("utf-8"))
+    assert response.status_code == 302
+    assert builds["count"] == 1
+
+    with client.application.app_context():
+        version = db.get_version(version_id)
+        assert version["record_count"] == 50_000
+        counts = db.get_counts(version_id, len(names))
+        for record_no in ("R0", "R1", "R12345", "R49999"):
+            record = db.get_record(version_id, record_no)
+            values = expected[record_no]
+            answer_map = {
+                index: value
+                for index, value in enumerate(values)
+                if value in ("是", "否")
+            }
+            assert record["categories"] == judge_module.judge(
+                version["definition"], answer_map
+            )
+            assert record["answers"] == values
+
+    # Counts add up to the record total for every item.
+    assert all(sum(entry.values()) == 50_000 for entry in counts)
 
 
 def test_versions_are_immutable_at_database_level(app):
